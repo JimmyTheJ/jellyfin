@@ -91,9 +91,8 @@ public partial class AudioNormalizationTask : IScheduledTask
             double nextPercent = numComplete + 1;
             nextPercent /= libraries.Length;
             nextPercent -= percent;
-            // Split the progress for this single library into two halves: album gain and track gain.
-            // The first half will be for album gain, the second half for track gain.
-            nextPercent /= 2;
+            // Split progress for this library into thirds: album gain, audio track gain, video item gain.
+            nextPercent /= 3;
             var albumComplete = 0;
 
             foreach (var a in albums)
@@ -116,7 +115,8 @@ public partial class AudioNormalizationTask : IScheduledTask
                         {
                             a.LUFS = await CalculateLUFSAsync(
                                 string.Format(CultureInfo.InvariantCulture, "-f concat -safe 0 -i \"{0}\"", tempFile),
-                                OperatingSystem.IsWindows(), // Wait for process to exit on Windows before we try deleting the concat file
+                                skipVideo: false,
+                                waitForExit: OperatingSystem.IsWindows(),
                                 cancellationToken).ConfigureAwait(false);
                             toSaveDbItems.Add(a);
                         }
@@ -174,7 +174,8 @@ public partial class AudioNormalizationTask : IScheduledTask
                 {
                     t.LUFS = await CalculateLUFSAsync(
                         string.Format(CultureInfo.InvariantCulture, "-i \"{0}\"", t.Path.Replace("\"", "\\\"", StringComparison.Ordinal)),
-                        false,
+                        skipVideo: false,
+                        waitForExit: false,
                         cancellationToken).ConfigureAwait(false);
                     toSaveDbItems.Add(t);
                 }
@@ -201,9 +202,56 @@ public partial class AudioNormalizationTask : IScheduledTask
             if (toSaveDbItems.Count > 1)
             {
                 _persistenceService.SaveItems(toSaveDbItems, cancellationToken);
+                toSaveDbItems.Clear();
             }
 
-            // Update progress
+            startDbSaveInterval = Stopwatch.GetTimestamp();
+
+            // Video item gain (Movies, Episodes, MusicVideos)
+            percent += nextPercent;
+            var videoItems = _libraryManager.GetItemList(new InternalItemsQuery
+            {
+                MediaTypes = [MediaType.Video],
+                IncludeItemTypes = [BaseItemKind.Movie, BaseItemKind.Episode, BaseItemKind.MusicVideo],
+                Parent = library,
+                Recursive = true
+            });
+
+            var videoComplete = 0;
+            foreach (var v in videoItems)
+            {
+                if (!v.NormalizationGain.HasValue && !v.LUFS.HasValue && v.IsFileProtocol)
+                {
+                    _logger.LogInformation("Calculating LUFS for video item: {Name} with id: {Id}", v.Name, v.Id);
+                    v.LUFS = await CalculateLUFSAsync(
+                        string.Format(CultureInfo.InvariantCulture, "-i \"{0}\"", v.Path.Replace("\"", "\\\"", StringComparison.Ordinal)),
+                        skipVideo: true,
+                        waitForExit: false,
+                        cancellationToken).ConfigureAwait(false);
+                    toSaveDbItems.Add(v);
+                }
+
+                if (Stopwatch.GetElapsedTime(startDbSaveInterval) > _dbSaveInterval)
+                {
+                    if (toSaveDbItems.Count > 1)
+                    {
+                        _persistenceService.SaveItems(toSaveDbItems, cancellationToken);
+                        toSaveDbItems.Clear();
+                    }
+
+                    startDbSaveInterval = Stopwatch.GetTimestamp();
+                }
+
+                videoComplete++;
+                double videoPercent = videoComplete;
+                videoPercent /= videoItems.Count;
+                progress.Report(100 * (percent + (videoPercent * nextPercent)));
+            }
+
+            if (toSaveDbItems.Count > 1)
+            {
+                _persistenceService.SaveItems(toSaveDbItems, cancellationToken);
+            }
             numComplete++;
             percent = numComplete;
             percent /= libraries.Length;
@@ -224,9 +272,10 @@ public partial class AudioNormalizationTask : IScheduledTask
         };
     }
 
-    private async Task<float?> CalculateLUFSAsync(string inputArgs, bool waitForExit, CancellationToken cancellationToken)
+    private async Task<float?> CalculateLUFSAsync(string inputArgs, bool skipVideo, bool waitForExit, CancellationToken cancellationToken)
     {
-        var args = $"-hide_banner {inputArgs} -af ebur128=framelog=verbose -f null -";
+        var outputArgs = skipVideo ? "-vn -af ebur128=framelog=verbose -f null -" : "-af ebur128=framelog=verbose -f null -";
+        var args = $"-hide_banner {inputArgs} {outputArgs}";
 
         using (var process = new Process()
         {
