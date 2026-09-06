@@ -24,18 +24,34 @@ namespace Jellyfin.Server.Implementations.Tests.ScheduledTasks;
 
 public class AudioNormalizationTaskTests
 {
-    [Theory]
-    [InlineData(false, "-hide_banner -i \"movie.mkv\" -af ebur128=framelog=verbose -f null -")]
-    [InlineData(true, "-hide_banner -i \"movie.mkv\" -vn -af ebur128=framelog=verbose -f null -")]
-    public void BuildFfmpegArguments_SkipVideo_InsertsVnForVideoFiles(bool skipVideo, string expected)
+    [Fact]
+    public void BuildFfmpegArguments_MapsFirstAudioStreamAndSkipsVideo()
     {
-        var args = AudioNormalizationTask.BuildFfmpegArguments("-i \"movie.mkv\"", skipVideo);
+        var args = AudioNormalizationTask.BuildFfmpegArguments("-i \"movie.mkv\"");
 
-        Assert.Equal(expected, args);
+        Assert.Equal("-hide_banner -nostdin -i \"movie.mkv\" -vn -sn -dn -map 0:a:0 -af ebur128 -f null -", args);
+    }
+
+    [Theory]
+    [InlineData("    I:         -23.7 LUFS", -23.7f)]
+    [InlineData("  I: -14.0 LUFS", -14f)]
+    public void TryParseSummaryLufs_SummaryLine_ParsesIntegratedLoudness(string line, float expected)
+    {
+        Assert.True(AudioNormalizationTask.TryParseSummaryLufs(line, out var lufs));
+        Assert.Equal(expected, lufs);
+    }
+
+    [Theory]
+    [InlineData("t: 0.5  TARGET:-23 LUFS    M: -70.0 S: -70.0     I: -70.0 LUFS       LRA:   0.0 LU")]
+    [InlineData("/media/movie.mkv: No such file or directory")]
+    [InlineData("    Threshold: -33.1 LUFS")]
+    public void TryParseSummaryLufs_NonSummaryLine_ReturnsFalse(string line)
+    {
+        Assert.False(AudioNormalizationTask.TryParseSummaryLufs(line, out _));
     }
 
     [Fact]
-    public async Task ExecuteAsync_MovieLibrary_QueriesAndPersistsVideoItems()
+    public async Task ExecuteAsync_MovieLibrary_QueriesVideoItems()
     {
         var movie = new Movie
         {
@@ -59,11 +75,7 @@ public class AudioNormalizationTaskTests
             .Returns((InternalItemsQuery q) =>
                 q.IncludeItemTypes.Contains(BaseItemKind.Movie) ? [movie] : Array.Empty<BaseItem>());
 
-        IReadOnlyList<BaseItem>? saved = null;
         var persistence = new Mock<IItemPersistenceService>();
-        persistence
-            .Setup(x => x.SaveItems(It.IsAny<IReadOnlyList<BaseItem>>(), It.IsAny<CancellationToken>()))
-            .Callback<IReadOnlyList<BaseItem>, CancellationToken>((items, _) => saved = items);
 
         var mediaEncoder = new Mock<IMediaEncoder>();
         mediaEncoder.SetupGet(x => x.EncoderPath).Returns(Path.Combine(Path.GetTempPath(), "missing-ffmpeg"));
@@ -86,8 +98,9 @@ public class AudioNormalizationTaskTests
                 && q.IncludeItemTypes.Contains(BaseItemKind.Episode)
                 && q.IncludeItemTypes.Contains(BaseItemKind.MusicVideo))),
             Times.Once);
-        Assert.NotNull(saved);
-        Assert.Same(movie, Assert.Single(saved));
+        persistence.Verify(
+            x => x.SaveItems(It.IsAny<IReadOnlyList<BaseItem>>(), It.IsAny<CancellationToken>()),
+            Times.Never);
     }
 
     [Fact]

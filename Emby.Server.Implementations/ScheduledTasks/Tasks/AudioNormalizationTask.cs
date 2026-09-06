@@ -73,8 +73,10 @@ public partial class AudioNormalizationTask : IScheduledTask
     /// <inheritdoc />
     public string Key => "AudioNormalization";
 
-    [GeneratedRegex(@"^\s+I:\s+(.*?)\s+LUFS")]
-    private static partial Regex LUFSRegex();
+    [GeneratedRegex(@"^\s+I:\s+(-?\d+(?:\.\d+)?)\s+LUFS")]
+    private static partial Regex LUFSSummaryRegex();
+
+    private const int MaxLoggedStderrLines = 40;
 
     /// <inheritdoc />
     public async Task ExecuteAsync(IProgress<double> progress, CancellationToken cancellationToken)
@@ -116,10 +118,12 @@ public partial class AudioNormalizationTask : IScheduledTask
                         {
                             a.LUFS = await CalculateLUFSAsync(
                                 string.Format(CultureInfo.InvariantCulture, "-f concat -safe 0 -i \"{0}\"", tempFile),
-                                skipVideo: false,
-                                waitForExit: OperatingSystem.IsWindows(),
+                                a.Name,
                                 cancellationToken).ConfigureAwait(false);
-                            toSaveDbItems.Add(a);
+                            if (a.LUFS.HasValue)
+                            {
+                                toSaveDbItems.Add(a);
+                            }
                         }
                         finally
                         {
@@ -172,10 +176,12 @@ public partial class AudioNormalizationTask : IScheduledTask
                 {
                     t.LUFS = await CalculateLUFSAsync(
                         string.Format(CultureInfo.InvariantCulture, "-i \"{0}\"", t.Path.EscapeProcessArgument()),
-                        skipVideo: false,
-                        waitForExit: false,
+                        t.Name,
                         cancellationToken).ConfigureAwait(false);
-                    toSaveDbItems.Add(t);
+                    if (t.LUFS.HasValue)
+                    {
+                        toSaveDbItems.Add(t);
+                    }
                 }
 
                 if (Stopwatch.GetElapsedTime(startDbSaveInterval) > _dbSaveInterval)
@@ -220,10 +226,12 @@ public partial class AudioNormalizationTask : IScheduledTask
                     _logger.LogInformation("Calculating LUFS for video item: {Name} with id: {Id}", v.Name, v.Id);
                     v.LUFS = await CalculateLUFSAsync(
                         string.Format(CultureInfo.InvariantCulture, "-i \"{0}\"", v.Path.EscapeProcessArgument()),
-                        skipVideo: true,
-                        waitForExit: false,
+                        v.Name,
                         cancellationToken).ConfigureAwait(false);
-                    toSaveDbItems.Add(v);
+                    if (v.LUFS.HasValue)
+                    {
+                        toSaveDbItems.Add(v);
+                    }
                 }
 
                 if (Stopwatch.GetElapsedTime(startDbSaveInterval) > _dbSaveInterval)
@@ -270,12 +278,24 @@ public partial class AudioNormalizationTask : IScheduledTask
     /// Builds the ffmpeg arguments used to measure EBU R128 integrated loudness.
     /// </summary>
     /// <param name="inputArgs">Input arguments, including <c>-i</c>.</param>
-    /// <param name="skipVideo">Whether to pass <c>-vn</c> so video streams are not decoded.</param>
     /// <returns>The complete ffmpeg argument string.</returns>
-    internal static string BuildFfmpegArguments(string inputArgs, bool skipVideo)
+    internal static string BuildFfmpegArguments(string inputArgs)
     {
-        var outputArgs = skipVideo ? "-vn -af ebur128=framelog=verbose -f null -" : "-af ebur128=framelog=verbose -f null -";
-        return $"-hide_banner {inputArgs} {outputArgs}";
+        return $"-hide_banner -nostdin {inputArgs} -vn -sn -dn -map 0:a:0 -af ebur128 -f null -";
+    }
+
+    /// <summary>
+    /// Parses an ffmpeg ebur128 summary line for integrated loudness.
+    /// </summary>
+    /// <param name="line">A single stderr line.</param>
+    /// <param name="lufs">The parsed LUFS value.</param>
+    /// <returns>Whether the line was a summary integrated-loudness value.</returns>
+    internal static bool TryParseSummaryLufs(string line, out float lufs)
+    {
+        lufs = 0;
+        var match = LUFSSummaryRegex().Match(line);
+        return match.Success
+            && float.TryParse(match.Groups[1].ValueSpan, NumberStyles.Float, CultureInfo.InvariantCulture, out lufs);
     }
 
     private static void ReportSubProgress(IProgress<double> progress, double percent, double nextPercent, int complete, int total)
@@ -284,72 +304,84 @@ public partial class AudioNormalizationTask : IScheduledTask
         progress.Report(100 * (percent + (portion * nextPercent)));
     }
 
-    private async Task<float?> CalculateLUFSAsync(string inputArgs, bool skipVideo, bool waitForExit, CancellationToken cancellationToken)
+    private async Task<float?> CalculateLUFSAsync(string inputArgs, string itemName, CancellationToken cancellationToken)
     {
-        var args = BuildFfmpegArguments(inputArgs, skipVideo);
+        var args = BuildFfmpegArguments(inputArgs);
 
-        using (var process = new Process()
+        using var process = new Process
         {
             StartInfo = new ProcessStartInfo
             {
                 FileName = _mediaEncoder.EncoderPath,
                 Arguments = args,
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
                 StandardErrorEncoding = Encoding.UTF8,
-                RedirectStandardError = true
-            },
-        })
+                CreateNoWindow = true
+            }
+        };
+
+        _logger.LogDebug("Starting ffmpeg for {Name} with arguments: {Arguments}", itemName, args);
+        try
         {
-            _logger.LogDebug("Starting ffmpeg with arguments: {Arguments}", args);
-            try
-            {
-                process.Start();
-            }
-            catch (Exception ex)
-            {
-                _logger.LogError(ex, "Error starting ffmpeg with arguments: {Arguments}", args);
-                return null;
-            }
-
-            try
-            {
-                process.PriorityClass = ProcessPriorityClass.BelowNormal;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "Error setting ffmpeg process priority");
-            }
-
-            using var reader = process.StandardError;
-            float? lufs = null;
-            var foundLufs = false;
-            await foreach (var line in reader.ReadAllLinesAsync(cancellationToken).ConfigureAwait(false))
-            {
-                if (foundLufs)
-                {
-                    continue;
-                }
-
-                Match match = LUFSRegex().Match(line);
-                if (!match.Success)
-                {
-                    continue;
-                }
-
-                lufs = float.Parse(match.Groups[1].ValueSpan, CultureInfo.InvariantCulture.NumberFormat);
-                foundLufs = true;
-            }
-
-            if (lufs is null)
-            {
-                _logger.LogError("Failed to find LUFS value in output");
-            }
-
-            if (waitForExit)
-            {
-                await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
-            }
-
-            return lufs;
+            process.Start();
         }
+        catch (Exception ex)
+        {
+            _logger.LogError(ex, "Error starting ffmpeg for {Name} with arguments: {Arguments}", itemName, args);
+            return null;
+        }
+
+        try
+        {
+            process.PriorityClass = ProcessPriorityClass.BelowNormal;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Error setting ffmpeg process priority");
+        }
+
+        var stdoutDrain = process.StandardOutput.ReadToEndAsync(cancellationToken);
+        float? lufs = null;
+        var stderrTail = new Queue<string>();
+
+        await foreach (var line in process.StandardError.ReadAllLinesAsync(cancellationToken).ConfigureAwait(false))
+        {
+            if (stderrTail.Count >= MaxLoggedStderrLines)
+            {
+                stderrTail.Dequeue();
+            }
+
+            stderrTail.Enqueue(line);
+
+            if (lufs is null && TryParseSummaryLufs(line, out var parsed))
+            {
+                lufs = parsed;
+            }
+        }
+
+        try
+        {
+            await stdoutDrain.ConfigureAwait(false);
+        }
+        catch (Exception ex)
+        {
+            _logger.LogDebug(ex, "Error draining ffmpeg stdout for {Name}", itemName);
+        }
+
+        await process.WaitForExitAsync(cancellationToken).ConfigureAwait(false);
+
+        if (lufs is null)
+        {
+            _logger.LogError(
+                "Failed to find LUFS value for {Name}. ExitCode: {ExitCode}. Arguments: {Arguments}. Output: {Output}",
+                itemName,
+                process.ExitCode,
+                args,
+                string.Join('\n', stderrTail));
+        }
+
+        return lufs;
     }
 }
