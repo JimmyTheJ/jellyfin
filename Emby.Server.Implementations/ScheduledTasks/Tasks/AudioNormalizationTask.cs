@@ -92,9 +92,8 @@ public partial class AudioNormalizationTask : IScheduledTask
             double nextPercent = numComplete + 1;
             nextPercent /= libraries.Length;
             nextPercent -= percent;
-            // Split the progress for this single library into two halves: album gain and track gain.
-            // The first half will be for album gain, the second half for track gain.
-            nextPercent /= 2;
+            // Split progress for this library into thirds: album gain, audio track gain, video item gain.
+            nextPercent /= 3;
             var albumComplete = 0;
 
             foreach (var a in albums)
@@ -117,7 +116,8 @@ public partial class AudioNormalizationTask : IScheduledTask
                         {
                             a.LUFS = await CalculateLUFSAsync(
                                 string.Format(CultureInfo.InvariantCulture, "-f concat -safe 0 -i \"{0}\"", tempFile),
-                                OperatingSystem.IsWindows(), // Wait for process to exit on Windows before we try deleting the concat file
+                                skipVideo: false,
+                                waitForExit: OperatingSystem.IsWindows(),
                                 cancellationToken).ConfigureAwait(false);
                             toSaveDbItems.Add(a);
                         }
@@ -148,10 +148,7 @@ public partial class AudioNormalizationTask : IScheduledTask
 
                 // Update sub-progress for album gain
                 albumComplete++;
-                double albumPercent = albumComplete;
-                albumPercent /= albums.Count;
-
-                progress.Report(100 * (percent + (albumPercent * nextPercent)));
+                ReportSubProgress(progress, percent, nextPercent, albumComplete, albums.Count);
             }
 
             // Update progress to start at the track gain percent calculation
@@ -175,7 +172,8 @@ public partial class AudioNormalizationTask : IScheduledTask
                 {
                     t.LUFS = await CalculateLUFSAsync(
                         string.Format(CultureInfo.InvariantCulture, "-i \"{0}\"", t.Path.EscapeProcessArgument()),
-                        false,
+                        skipVideo: false,
+                        waitForExit: false,
                         cancellationToken).ConfigureAwait(false);
                     toSaveDbItems.Add(t);
                 }
@@ -193,18 +191,61 @@ public partial class AudioNormalizationTask : IScheduledTask
 
                 // Update sub-progress for track gain
                 tracksComplete++;
-                double trackPercent = tracksComplete;
-                trackPercent /= tracks.Count;
-
-                progress.Report(100 * (percent + (trackPercent * nextPercent)));
+                ReportSubProgress(progress, percent, nextPercent, tracksComplete, tracks.Count);
             }
 
-            if (toSaveDbItems.Count > 1)
+            if (toSaveDbItems.Count > 0)
+            {
+                _persistenceService.SaveItems(toSaveDbItems, cancellationToken);
+                toSaveDbItems.Clear();
+            }
+
+            startDbSaveInterval = Stopwatch.GetTimestamp();
+
+            // Video item gain (Movies, Episodes, MusicVideos)
+            percent += nextPercent;
+            var videoItems = _libraryManager.GetItemList(new InternalItemsQuery
+            {
+                MediaTypes = [MediaType.Video],
+                IncludeItemTypes = [BaseItemKind.Movie, BaseItemKind.Episode, BaseItemKind.MusicVideo],
+                Parent = library,
+                Recursive = true
+            });
+
+            var videoComplete = 0;
+            foreach (var v in videoItems)
+            {
+                if (!v.NormalizationGain.HasValue && !v.LUFS.HasValue && v.IsFileProtocol)
+                {
+                    _logger.LogInformation("Calculating LUFS for video item: {Name} with id: {Id}", v.Name, v.Id);
+                    v.LUFS = await CalculateLUFSAsync(
+                        string.Format(CultureInfo.InvariantCulture, "-i \"{0}\"", v.Path.EscapeProcessArgument()),
+                        skipVideo: true,
+                        waitForExit: false,
+                        cancellationToken).ConfigureAwait(false);
+                    toSaveDbItems.Add(v);
+                }
+
+                if (Stopwatch.GetElapsedTime(startDbSaveInterval) > _dbSaveInterval)
+                {
+                    if (toSaveDbItems.Count > 1)
+                    {
+                        _persistenceService.SaveItems(toSaveDbItems, cancellationToken);
+                        toSaveDbItems.Clear();
+                    }
+
+                    startDbSaveInterval = Stopwatch.GetTimestamp();
+                }
+
+                videoComplete++;
+                ReportSubProgress(progress, percent, nextPercent, videoComplete, videoItems.Count);
+            }
+
+            if (toSaveDbItems.Count > 0)
             {
                 _persistenceService.SaveItems(toSaveDbItems, cancellationToken);
             }
 
-            // Update progress
             numComplete++;
             percent = numComplete;
             percent /= libraries.Length;
@@ -225,9 +266,27 @@ public partial class AudioNormalizationTask : IScheduledTask
         };
     }
 
-    private async Task<float?> CalculateLUFSAsync(string inputArgs, bool waitForExit, CancellationToken cancellationToken)
+    /// <summary>
+    /// Builds the ffmpeg arguments used to measure EBU R128 integrated loudness.
+    /// </summary>
+    /// <param name="inputArgs">Input arguments, including <c>-i</c>.</param>
+    /// <param name="skipVideo">Whether to pass <c>-vn</c> so video streams are not decoded.</param>
+    /// <returns>The complete ffmpeg argument string.</returns>
+    internal static string BuildFfmpegArguments(string inputArgs, bool skipVideo)
     {
-        var args = $"-hide_banner {inputArgs} -af ebur128=framelog=verbose -f null -";
+        var outputArgs = skipVideo ? "-vn -af ebur128=framelog=verbose -f null -" : "-af ebur128=framelog=verbose -f null -";
+        return $"-hide_banner {inputArgs} {outputArgs}";
+    }
+
+    private static void ReportSubProgress(IProgress<double> progress, double percent, double nextPercent, int complete, int total)
+    {
+        var portion = total == 0 ? 1d : (double)complete / total;
+        progress.Report(100 * (percent + (portion * nextPercent)));
+    }
+
+    private async Task<float?> CalculateLUFSAsync(string inputArgs, bool skipVideo, bool waitForExit, CancellationToken cancellationToken)
+    {
+        var args = BuildFfmpegArguments(inputArgs, skipVideo);
 
         using (var process = new Process()
         {
