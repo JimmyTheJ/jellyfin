@@ -83,6 +83,7 @@ public partial class AudioNormalizationTask : IScheduledTask
     {
         var numComplete = 0;
         var libraries = _libraryManager.RootFolder.Children.Where(library => _libraryManager.GetLibraryOptions(library).EnableLUFSScan).ToArray();
+        _logger.LogInformation("Audio Normalization starting with video LUFS scan. Libraries enabled: {Count}", libraries.Length);
         double percent = 0;
 
         foreach (var library in libraries)
